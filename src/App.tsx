@@ -34,6 +34,7 @@ import { sanitizeText, splitIntoSentences, countWords, estimateReadingMinutes } 
 import { speechEngine } from './utils/speechEngine';
 import { generateSampleDocuments } from './data/sampleDocs';
 import { initGoogleDriveAuth } from './utils/googleDriveService';
+import { initShareIntentListener } from './utils/shareIntent';
 
 export default function App() {
   const [preferences, setPreferences] = useState<ReaderPreferences>(getSavedPreferences);
@@ -293,6 +294,11 @@ export default function App() {
       setIsLoadingFile(false);
     }
   };
+
+  // Receive files shared into the app from other apps' Share sheet (Android only)
+  useEffect(() => {
+    return initShareIntentListener(handleFileSelected);
+  }, []);
 
   // Handle sample document selection
   const handleSelectSample = (sample: DocumentItem) => {
