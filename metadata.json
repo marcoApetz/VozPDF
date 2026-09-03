@@ -1,0 +1,6 @@
+{
+  "name": "VozPDF - Leitor de PDF em Voz Alta",
+  "description": "Leitor minimalista de PDF, Word (.docx), TXT e Google Docs com síntese de voz offline (TTS), integração direta com Google Drive, bibliotecas/playlists de leitura sequencial contínua e limpeza inteligente de ruídos e repetições de caracteres.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
