@@ -1,3 +1,5 @@
+import { Capacitor } from '@capacitor/core';
+import { TextToSpeech, QueueStrategy } from '@capacitor-community/text-to-speech';
 import { VoiceOption, PageData } from '../types';
 
 export interface SpeechEngineCallbacks {
@@ -11,11 +13,23 @@ export interface SpeechEngineCallbacks {
 }
 
 export class SpeechEngine {
+  // On Android (packaged as a native app via Capacitor), the WebView's Web Speech
+  // API is unreliable once the screen locks or the app loses focus. We use the
+  // device's native TextToSpeech engine instead in that case; the browser
+  // (window.speechSynthesis) path below stays untouched for the web app.
+  private readonly isNative = Capacitor.isNativePlatform();
   private synth: SpeechSynthesis | null = null;
   private currentUtterance: SpeechSynthesisUtterance | null = null;
   private isPlaying = false;
   private isPaused = false;
   private heartbeatInterval: number | null = null;
+
+  // Native TTS state
+  private nativeVoices: SpeechSynthesisVoice[] = [];
+  private nativeVoicesReady: Promise<void> = Promise.resolve();
+  // Bumped on every stop/pause/new-sentence so a stale `speak()` completion
+  // (native TTS has no real pause, only stop) can't advance the reader.
+  private speakToken = 0;
 
   // Active state
   private pages: PageData[] = [];
@@ -35,7 +49,14 @@ export class SpeechEngine {
   private paragraphRepeatIteration = 0; // 0 = first pass, 1 = 2nd pass
 
   constructor() {
-    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+    if (this.isNative) {
+      this.nativeVoicesReady = this.loadNativeVoices();
+      TextToSpeech.addListener('onRangeStart', (info) => {
+        if (this.isPlaying && !this.isPaused) {
+          this.callbacks.onWordBoundary?.(info.start, info.end - info.start);
+        }
+      });
+    } else if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       this.synth = window.speechSynthesis;
       this.loadVoices();
 
@@ -45,8 +66,22 @@ export class SpeechEngine {
     }
   }
 
+  private async loadNativeVoices(): Promise<void> {
+    try {
+      const { voices } = await TextToSpeech.getSupportedVoices();
+      this.nativeVoices = voices;
+    } catch (e) {
+      console.warn('Não foi possível carregar as vozes nativas:', e);
+    }
+  }
+
   public isSupported(): boolean {
-    return this.synth !== null;
+    return this.isNative || this.synth !== null;
+  }
+
+  /** Resolves once the voice list is available (native voices load asynchronously). */
+  public async waitForVoices(): Promise<void> {
+    if (this.isNative) await this.nativeVoicesReady;
   }
 
   public setCallbacks(callbacks: SpeechEngineCallbacks) {
@@ -125,9 +160,9 @@ export class SpeechEngine {
   }
 
   public getVoices(): VoiceOption[] {
-    if (!this.synth) return [];
-    const voices = this.synth.getVoices();
-    this.availableVoices = voices;
+    const voices = this.isNative ? this.nativeVoices : this.synth?.getVoices() ?? [];
+    if (!this.isNative) this.availableVoices = voices;
+    if (voices.length === 0) return [];
 
     return voices.map((v) => {
       const isPortuguese = v.lang.toLowerCase().startsWith('pt');
@@ -167,7 +202,7 @@ export class SpeechEngine {
   }
 
   public play(pageIndex?: number, sentenceIndex?: number) {
-    if (!this.synth || this.pages.length === 0) return;
+    if (!this.isSupported() || this.pages.length === 0) return;
 
     if (pageIndex !== undefined) {
       this.currentPageIndex = Math.max(0, Math.min(this.pages.length - 1, pageIndex));
@@ -190,16 +225,27 @@ export class SpeechEngine {
   }
 
   public pause() {
-    if (!this.synth || !this.isPlaying) return;
-    this.synth.pause();
+    if (!this.isPlaying) return;
+    if (this.isNative) {
+      this.speakToken++; // invalidate the in-flight speak() completion
+      TextToSpeech.stop();
+    } else {
+      this.synth?.pause();
+    }
     this.isPaused = true;
     this.notifyState();
   }
 
   public resume() {
-    if (!this.synth) return;
-    if (this.isPaused) {
-      this.synth.resume();
+    if (!this.isSupported()) return;
+    if (this.isPaused && this.isNative) {
+      // Native TTS has no real resume: replay the current sentence from its start.
+      this.isPaused = false;
+      this.isPlaying = true;
+      this.notifyState();
+      this.speakCurrentSentence();
+    } else if (this.isPaused) {
+      this.synth?.resume();
       this.isPaused = false;
       this.isPlaying = true;
       this.notifyState();
@@ -209,9 +255,14 @@ export class SpeechEngine {
   }
 
   public stop() {
-    if (!this.synth) return;
+    if (!this.isSupported()) return;
+    this.speakToken++; // invalidate the in-flight speak() completion
     this.stopHeartbeat();
-    this.synth.cancel();
+    if (this.isNative) {
+      TextToSpeech.stop();
+    } else {
+      this.synth?.cancel();
+    }
     this.isPlaying = false;
     this.isPaused = false;
     this.currentUtterance = null;
@@ -356,10 +407,15 @@ export class SpeechEngine {
   }
 
   private speakCurrentSentence() {
-    if (!this.synth) return;
+    if (!this.isSupported()) return;
 
     // Cancel any ongoing utterance
-    this.synth.cancel();
+    if (this.isNative) {
+      this.speakToken++;
+      TextToSpeech.stop();
+    } else {
+      this.synth?.cancel();
+    }
 
     const page = this.pages[this.currentPageIndex];
     if (!page || page.sentences.length === 0) {
@@ -399,31 +455,38 @@ export class SpeechEngine {
       return;
     }
 
+    if (this.isNative) {
+      this.speakNative(textToSpeak);
+    } else {
+      this.speakWeb(textToSpeak);
+    }
+  }
+
+  private findVoice(voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice | undefined {
+    // Apply voice: prioritize female Portuguese voice
+    if (this.selectedVoiceURI) {
+      const selected =
+        voices.find((v) => v.voiceURI === this.selectedVoiceURI) ??
+        voices.find((v) => v.name === this.selectedVoiceURI);
+      if (selected) return selected;
+    }
+
+    const ptVoices = voices.filter((v) => v.lang.toLowerCase().startsWith('pt'));
+    const femalePt = ptVoices.find((v) => this.detectGender(v.name, v.voiceURI) === 'female');
+    const anyPt = femalePt || ptVoices.find((v) => this.detectGender(v.name, v.voiceURI) !== 'male') || ptVoices[0];
+    if (anyPt) return anyPt;
+
+    return voices.find((v) => this.detectGender(v.name, v.voiceURI) === 'female');
+  }
+
+  private speakWeb(textToSpeak: string) {
+    if (!this.synth) return;
+
     const utterance = new SpeechSynthesisUtterance(textToSpeak);
     this.currentUtterance = utterance;
 
-    // Apply voice: prioritize female Portuguese voice
-    if (this.selectedVoiceURI) {
-      let selected = this.availableVoices.find((v) => v.voiceURI === this.selectedVoiceURI);
-      if (!selected) {
-        selected = this.availableVoices.find((v) => v.name === this.selectedVoiceURI);
-      }
-      if (selected) utterance.voice = selected;
-    } 
-    
-    if (!utterance.voice) {
-      // Default to PT-BR female voice if available
-      const ptVoices = this.availableVoices.filter((v) => v.lang.toLowerCase().startsWith('pt'));
-      const femalePt = ptVoices.find((v) => this.detectGender(v.name, v.voiceURI) === 'female');
-      const anyPt = femalePt || ptVoices.find((v) => this.detectGender(v.name, v.voiceURI) !== 'male') || ptVoices[0];
-      
-      if (anyPt) {
-        utterance.voice = anyPt;
-      } else {
-        const femaleVoice = this.availableVoices.find((v) => this.detectGender(v.name, v.voiceURI) === 'female');
-        if (femaleVoice) utterance.voice = femaleVoice;
-      }
-    }
+    const voice = this.findVoice(this.availableVoices);
+    if (voice) utterance.voice = voice;
 
     utterance.rate = this.rate;
     utterance.pitch = this.pitch;
@@ -456,8 +519,46 @@ export class SpeechEngine {
     this.synth.speak(utterance);
   }
 
-  // Prevent Chrome from sleeping during long TTS
+  private async speakNative(textToSpeak: string) {
+    await this.nativeVoicesReady;
+
+    const token = ++this.speakToken;
+    const voice = this.findVoice(this.nativeVoices);
+    const voiceIndex = voice ? this.nativeVoices.indexOf(voice) : undefined;
+
+    this.callbacks.onSentenceStart?.(this.currentPageIndex, this.currentSentenceIndex);
+
+    try {
+      await TextToSpeech.speak({
+        text: textToSpeak,
+        lang: voice?.lang || 'pt-BR',
+        rate: this.rate,
+        pitch: this.pitch,
+        volume: this.volume,
+        voice: voiceIndex,
+        category: 'playback',
+        queueStrategy: QueueStrategy.Flush,
+      });
+    } catch (e) {
+      if (token === this.speakToken) {
+        console.warn('Native TTS error:', e);
+        this.callbacks.onError?.('Erro na leitura de voz');
+      }
+      return;
+    }
+
+    // A stale token means this sentence was stopped/paused or superseded before it finished.
+    if (token !== this.speakToken) return;
+
+    this.callbacks.onSentenceEnd?.(this.currentPageIndex, this.currentSentenceIndex);
+    if (this.isPlaying && !this.isPaused) {
+      this.nextSentence();
+    }
+  }
+
+  // Prevent Chrome from sleeping during long TTS (not needed on native Android TTS)
   private startHeartbeat() {
+    if (this.isNative) return;
     this.stopHeartbeat();
     this.heartbeatInterval = window.setInterval(() => {
       if (this.synth && this.isPlaying && !this.isPaused && this.synth.speaking) {

@@ -148,6 +148,7 @@ export default function App() {
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       window.speechSynthesis.onvoiceschanged = updateVoices;
     }
+    speechEngine.waitForVoices().then(updateVoices);
 
     // 4. Initialize Google Drive client auth
     initGoogleDriveAuth();
